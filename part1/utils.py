@@ -43,22 +43,55 @@ def custom_transform(example):
     # how you could implement two of them --- synonym replacement and typos.
 
     # You should update example["text"] using your transformation
+    # text = example["text"]
+    # words = text.split()
+    # new_words = []
+    # for word in words:
+    #     # typo 
+    #     if len(word) > 3 and random.random() < 0.4: # randomness for less acc
+    #         chars = list(word)
+    #         idx = random.randint(0, len(chars) - 2)
+    #         chars[idx], chars[idx + 1] = chars[idx + 1], chars[idx]
+    #         word = "".join(chars)
+    #     new_words.append(word)
+    # example["text"] = " ".join(new_words)
+    
+
+    # raise NotImplementedError
+
     text = example["text"]
     words = text.split()
     new_words = []
 
+    vowel_map = {
+        'a': 'e', 'e': 'i', 'i': 'o', 'o': 'u', 'u': 'a'
+    }
+
     for word in words:
-        # typo 
-        if len(word) > 3 and random.random() < 0.4: # randomness for less acc
-            chars = list(word)
+        w = word
+
+        # swap 
+        if len(w) > 3 and random.random() < 0.45:
+            chars = list(w)
             idx = random.randint(0, len(chars) - 2)
             chars[idx], chars[idx + 1] = chars[idx + 1], chars[idx]
-            word = "".join(chars)
-        new_words.append(word)
-    example["text"] = " ".join(new_words)
-    
+            w = "".join(chars)
 
-    # raise NotImplementedError
+        #vowel 
+        if random.random() < 0.30:
+            chars = list(w)
+            for i, c in enumerate(chars):
+                if c.lower() in vowel_map and random.random() < 0.5:
+                    new_c = vowel_map[c.lower()]
+                    chars[i] = new_c.upper() if c.isupper() else new_c
+            w = "".join(chars)
+        # drop filler
+        if w.lower() in ["the", "a", "an", "is", "was", "to", "of"] and random.random() < 0.25:
+            continue
+
+        new_words.append(w)
+
+    example["text"] = " ".join(new_words)
 
     ##### YOUR CODE ENDS HERE ######
 

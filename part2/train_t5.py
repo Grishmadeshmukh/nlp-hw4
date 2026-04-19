@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import wandb
-from transformers import T5TokenizerFast
+
 from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
 from transformers import GenerationConfig
 from load_data import load_t5_data
@@ -39,6 +39,19 @@ def get_args():
     parser.add_argument('--patience_epochs', type=int, default=0,
                         help="If validation performance stops improving, how many epochs should we wait before stopping?")
 
+    # Evaluation throttling (full eval includes generation + SQL execution, which is slow)
+    parser.add_argument(
+        '--full_eval_every_epochs',
+        type=int,
+        default=1,
+        help="Run full dev evaluation (Record F1/EM/SQL EM + SQL error rate) every N epochs. Use e.g. 10 to speed up training."
+    )
+    parser.add_argument(
+        '--always_full_eval_last_epoch',
+        action='store_true',
+        help="If set, always run a full dev evaluation on the last epoch even if it doesn't align with full_eval_every_epochs."
+    )
+
     parser.add_argument('--use_wandb', action='store_true',
                         help="If set, we will use wandb to keep track of experiments")
     parser.add_argument('--experiment_name', type=str, default='experiment',
@@ -58,7 +71,6 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     model_type = 'ft' if args.finetune else 'scr'
     checkpoint_dir = os.path.join('checkpoints', f'{model_type}_experiments', args.experiment_name)
     gt_sql_path = os.path.join(f'data/dev.sql')
-    # gt_record_path = os.path.join(f'records/dev_gt_records.pkl')
     gt_record_path = os.path.join(f'records/ground_truth_dev.pkl')
     model_sql_path = os.path.join(f'results/t5_{model_type}_{args.experiment_name}_dev.sql')
     model_record_path = os.path.join(f'records/t5_{model_type}_{args.experiment_name}_dev.pkl')
@@ -66,34 +78,72 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
         tr_loss = train_epoch(args, model, train_loader, optimizer, scheduler)
         print(f"Epoch {epoch}: Average train loss was {tr_loss}")
 
-        eval_loss, record_f1, record_em, sql_em, error_rate = eval_epoch(args, model, dev_loader,
-                                                                         gt_sql_path, model_sql_path,
-                                                                         gt_record_path, model_record_path)
-        print(f"Epoch {epoch}: Dev loss: {eval_loss}, Record F1: {record_f1}, Record EM: {record_em}, SQL EM: {sql_em}")
-        print(f"Epoch {epoch}: {error_rate*100:.2f}% of the generated outputs led to SQL errors")
+        # Fast dev check: just compute cross-entropy loss (no generation / no SQL execution).
+        eval_loss, *_ = eval_epoch(
+            args,
+            model,
+            dev_loader,
+            gt_sql_path,
+            model_sql_path,
+            gt_record_path,
+            model_record_path,
+            compute_generation_metrics=False,
+        )
+        print(f"Epoch {epoch}: Dev loss: {eval_loss}")
+
+        run_full_eval = (args.full_eval_every_epochs > 0 and (epoch % args.full_eval_every_epochs == 0))
+        if args.always_full_eval_last_epoch and epoch == (args.max_n_epochs - 1):
+            run_full_eval = True
+
+        record_f1 = None
+        record_em = None
+        sql_em = None
+        error_rate = None
+        if run_full_eval:
+            eval_loss, record_f1, record_em, sql_em, error_rate = eval_epoch(
+                args,
+                model,
+                dev_loader,
+                gt_sql_path,
+                model_sql_path,
+                gt_record_path,
+                model_record_path,
+                compute_generation_metrics=True,
+            )
+            print(
+                f"Epoch {epoch}: Dev loss: {eval_loss}, Record F1: {record_f1}, Record EM: {record_em}, SQL EM: {sql_em}"
+            )
+            print(f"Epoch {epoch}: {error_rate*100:.2f}% of the generated outputs led to SQL errors")
 
         if args.use_wandb:
             result_dict = {
                 'train/loss' : tr_loss,
                 'dev/loss' : eval_loss,
-                'dev/record_f1' : record_f1,
-                'dev/record_em' : record_em,
-                'dev/sql_em' : sql_em,
-                'dev/error_rate' : error_rate,
             }
+            if record_f1 is not None:
+                result_dict.update(
+                    {
+                        'dev/record_f1': record_f1,
+                        'dev/record_em': record_em,
+                        'dev/sql_em': sql_em,
+                        'dev/error_rate': error_rate,
+                    }
+                )
             wandb.log(result_dict, step=epoch)
 
-        if record_f1 > best_f1:
-            best_f1 = record_f1
-            epochs_since_improvement = 0
-        else:
-            epochs_since_improvement += 1
+        # Only update early-stopping / best-checkpoint when we actually computed Record F1.
+        if record_f1 is not None:
+            if record_f1 > best_f1:
+                best_f1 = record_f1
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
 
         save_model(checkpoint_dir, model, best=False)
-        if epochs_since_improvement == 0:
+        if record_f1 is not None and epochs_since_improvement == 0:
             save_model(checkpoint_dir, model, best=True)
 
-        if epochs_since_improvement >= args.patience_epochs:
+        if record_f1 is not None and epochs_since_improvement >= args.patience_epochs:
             break
 
 def train_epoch(args, model, train_loader, optimizer, scheduler):
@@ -129,7 +179,16 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
 
     return total_loss / total_tokens
         
-def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_path, model_record_path):
+def eval_epoch(
+    args,
+    model,
+    dev_loader,
+    gt_sql_pth,
+    model_sql_path,
+    gt_record_path,
+    model_record_path,
+    compute_generation_metrics: bool = True,
+):
     '''
     You must implement the evaluation loop to be using during training. We recommend keeping track
     of the model loss on the SQL queries, the metrics compute_metrics returns (save_queries_and_records should be helpful)
@@ -139,77 +198,85 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     should both provide good results. If you find that this component of evaluation takes too long with your compute,
     we found the cross-entropy loss (in the evaluation set) to be well (albeit imperfectly) correlated with F1 performance.
     '''
-    # TODO
     model.eval()
+    from transformers import T5TokenizerFast
+    tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
     total_loss = 0
     total_tokens = 0
     criterion = nn.CrossEntropyLoss()
-    all_queries = []
-    tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
-    with torch.no_grad():
-        for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(dev_loader):
-            encoder_input = encoder_input.to(DEVICE)
-            encoder_mask = encoder_mask.to(DEVICE)
-            decoder_input = decoder_input.to(DEVICE)
-            decoder_targets = decoder_targets.to(DEVICE)
-            outputs = model(
+    generated_sql = [] if compute_generation_metrics else None
+
+    for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(dev_loader):
+        encoder_input = encoder_input.to(DEVICE)
+        encoder_mask = encoder_mask.to(DEVICE)
+        decoder_input = decoder_input.to(DEVICE)
+        decoder_targets = decoder_targets.to(DEVICE)
+
+        with torch.no_grad():
+            logits = model(
                 input_ids=encoder_input,
                 attention_mask=encoder_mask,
-                decoder_input_ids=decoder_input
-            )
+                decoder_input_ids=decoder_input,
+            )["logits"]
 
-            logits = outputs["logits"]
             non_pad = decoder_targets != PAD_IDX
             loss = criterion(logits[non_pad], decoder_targets[non_pad])
+
             num_tokens = torch.sum(non_pad).item()
             total_loss += loss.item() * num_tokens
             total_tokens += num_tokens
 
-            preds = model.generate(
-                input_ids=encoder_input,
-                attention_mask=encoder_mask,
-                max_length=128,
-                num_beams=4
-            )
-            # all_queries.extend(preds.cpu().numpy())
-            decoded = tokenizer.batch_decode(preds, skip_special_tokens=True)
-            all_queries.extend(decoded)
+            if compute_generation_metrics:
+                generation = model.generate(
+                    input_ids=encoder_input,
+                    attention_mask=encoder_mask,
+                    max_length=256,
+                    num_beams=4,
+                    early_stopping=True,
+                )
+                decoded = tokenizer.batch_decode(generation, skip_special_tokens=True)
+                generated_sql.extend([x.strip() for x in decoded])
 
-    avg_loss = total_loss / total_tokens
-    save_queries_and_records(all_queries, model_sql_path, model_record_path)
+    eval_loss = total_loss / max(total_tokens, 1)
 
-    sql_em, record_em, record_f1, error_msgs = compute_metrics(gt_sql_pth, model_sql_path,gt_record_path,model_record_path )
-    num_errors = sum([1 for e in error_msgs if e != ""])
-    error_rate = num_errors / len(error_msgs)
-    return avg_loss, record_f1, record_em, sql_em, error_rate
-    # return 0, 0, 0, 0, 0
+    if not compute_generation_metrics:
+        return eval_loss, None, None, None, None
+
+    save_queries_and_records(generated_sql, model_sql_path, model_record_path)
+    sql_em, record_em, record_f1, error_msgs = compute_metrics(
+        gt_sql_pth, model_sql_path, gt_record_path, model_record_path
+    )
+    error_rate = np.mean([1 if msg != "" else 0 for msg in error_msgs])
+    return eval_loss, record_f1, record_em, sql_em, error_rate
         
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     '''
     You must implement inference to compute your model's generated SQL queries and its associated 
     database records. Implementation should be very similar to eval_epoch.
     '''
-    # pass
-    all_queries = []
+    model.eval()
+    from transformers import T5TokenizerFast
     tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+    generated_sql = []
 
-    with torch.no_grad():
-        for encoder_input, encoder_mask, _, _, _ in tqdm(test_loader):
-            encoder_input = encoder_input.to(DEVICE)
-            encoder_mask = encoder_mask.to(DEVICE)
+    for encoder_input, encoder_mask, initial_decoder_inputs in tqdm(test_loader):
+        encoder_input = encoder_input.to(DEVICE)
+        encoder_mask = encoder_mask.to(DEVICE)
+        initial_decoder_inputs = initial_decoder_inputs.to(DEVICE)
 
-            preds = model.generate(
+        with torch.no_grad():
+            generation = model.generate(
                 input_ids=encoder_input,
                 attention_mask=encoder_mask,
-                max_length=128,
-                num_beams=4
+                decoder_input_ids=initial_decoder_inputs,
+                max_length=256,
+                num_beams=4,
+                early_stopping=True,
             )
+        decoded = tokenizer.batch_decode(generation, skip_special_tokens=True)
+        generated_sql.extend([x.strip() for x in decoded])
 
-            # all_queries.extend(preds.cpu().numpy())
-            decoded = tokenizer.batch_decode(preds, skip_special_tokens=True)
-            all_queries.extend(decoded)
-
-    save_queries_and_records(all_queries, model_sql_path, model_record_path)
+    save_queries_and_records(generated_sql, model_sql_path, model_record_path)
 
 def main():
     # Get key arguments
@@ -234,14 +301,13 @@ def main():
     experiment_name = args.experiment_name
     model_type = 'ft' if args.finetune else 'scr'
     gt_sql_path = os.path.join(f'data/dev.sql')
-    # gt_record_path = os.path.join(f'records/dev_gt_records.pkl')
     gt_record_path = os.path.join(f'records/ground_truth_dev.pkl')
     model_sql_path = os.path.join(f'results/t5_{model_type}_{experiment_name}_dev.sql')
     model_record_path = os.path.join(f'records/t5_{model_type}_{experiment_name}_dev.pkl')
-    dev_loss, dev_record_em, dev_record_f1, dev_sql_em, dev_error_rate = eval_epoch(args, model, dev_loader,
+    dev_loss, dev_record_f1, dev_record_em, dev_sql_em, dev_error_rate = eval_epoch(args, model, dev_loader,
                                                                                     gt_sql_path, model_sql_path,
                                                                                     gt_record_path, model_record_path)
-    print("Dev set results: Loss: {dev_loss}, Record F1: {dev_record_f1}, Record EM: {dev_record_em}, SQL EM: {dev_sql_em}")
+    print(f"Dev set results: Loss: {dev_loss}, Record F1: {dev_record_f1}, Record EM: {dev_record_em}, SQL EM: {dev_sql_em}")
     print(f"Dev set results: {dev_error_rate*100:.2f}% of the generated outputs led to SQL errors")
 
     # Test set

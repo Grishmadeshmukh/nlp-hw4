@@ -11,7 +11,7 @@ DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 def setup_wandb(args):
     # Implement this if you wish to use wandb in your experiments
-    pass
+    wandb.init(project="csci2590-hw4-t5", name=args.experiment_name, config=vars(args))
 
 def initialize_model(args):
     '''
@@ -26,7 +26,6 @@ def initialize_model(args):
         config = T5Config.from_pretrained("google-t5/t5-small")
         model = T5ForConditionalGeneration(config)
     return model.to(DEVICE)
-    # pass
 
 def mkdir(dirpath):
     if not os.path.exists(dirpath):
@@ -37,22 +36,22 @@ def mkdir(dirpath):
 
 def save_model(checkpoint_dir, model, best):
     # Save model checkpoint to be able to load the model later
-    # pass
     mkdir(checkpoint_dir)
-    filename = "best.pt" if best else "last.pt"
-    save_path = os.path.join(checkpoint_dir, filename)
+    model_name = "best_model.pt" if best else "last_model.pt"
+    save_path = os.path.join(checkpoint_dir, model_name)
     torch.save(model.state_dict(), save_path)
 
 def load_model_from_checkpoint(args, best):
     # Load model from a checkpoint
-    # pass
     model = initialize_model(args)
     model_type = "ft" if args.finetune else "scr"
-    checkpoint_dir = os.path.join("checkpoints", f"{model_type}_experiments",args.experiment_name)
-    filename = "best.pt" if best else "last.pt"
-    load_path = os.path.join(checkpoint_dir, filename)
-    model.load_state_dict(torch.load(load_path, map_location=DEVICE))
-    return model.to(DEVICE)
+    checkpoint_dir = os.path.join("checkpoints", f"{model_type}_experiments", args.experiment_name)
+    model_name = "best_model.pt" if best else "last_model.pt"
+    load_path = os.path.join(checkpoint_dir, model_name)
+    state_dict = torch.load(load_path, map_location=DEVICE)
+    model.load_state_dict(state_dict)
+    model.to(DEVICE)
+    return model
 
 def initialize_optimizer_and_scheduler(args, model, epoch_length):
     optimizer = initialize_optimizer(args, model)
